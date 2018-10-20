@@ -55,7 +55,7 @@ PICKLE_CACHE_THRESHOLD = 1.0
 
 
 def load_file(filename, log_timings=None, log_errors=None, extra_validations=None,
-              encoding=None):
+              encoding=None, include_handler=None):
     """Open a Beancount input file, parse it, run transformations and validate.
 
     Args:
@@ -67,6 +67,7 @@ def load_file(filename, log_timings=None, log_errors=None, extra_validations=Non
       extra_validations: A list of extra validation functions to run after loading
         this list of entries.
       encoding: A string or None, the encoding to decode the input filename with.
+      include_handler: A function that takes the directory of the 
     Returns:
       A triple of (entries, errors, option_map) where "entries" is a date-sorted
       list of entries from the file, "errors" a list of error objects generated
@@ -249,7 +250,7 @@ def compute_input_hash(filenames):
 
 
 def load_string(string, log_timings=None, log_errors=None, extra_validations=None,
-                dedent=False, encoding=None):
+                dedent=False, encoding=None, include_handler=None):
 
     """Open a Beancount input string, parse it, run transformations and validate.
 
@@ -272,12 +273,37 @@ def load_string(string, log_timings=None, log_errors=None, extra_validations=Non
     if dedent:
         string = textwrap.dedent(string)
     entries, errors, options_map = _load([(string, False)], log_timings,
-                                         extra_validations, encoding)
+                                         extra_validations, encoding, include_handler)
     _log_errors(errors, log_errors)
     return entries, errors, options_map
 
 
-def _parse_recursive(sources, log_timings, encoding=None):
+def _include_handler(cwd, include_filename):
+    sources = []
+    errors = []
+    if cwd is None:
+        # If we're parsing a string, the CWD is the current process
+        # working directory.
+        cwd = os.getcwd()
+    # chdir() for glob, which uses it indirectly.
+    with file_utils.chdir(cwd):
+        matched_filenames = glob.glob(include_filename, recursive=True)
+        if matched_filenames:
+            for include_filename in matched_filenames:
+                if not path.isabs(include_filename):
+                    include_filename = path.join(cwd, include_filename)
+                    include_filename = path.normpath(include_filename)
+
+            # Add the include filenames to be processed later.
+            sources.append((include_filename, True))
+        else:
+            errors.append(
+                LoadError(data.new_metadata("<load>", 0),
+                            'File glob "{}" does not match any files'.format(
+                                include_filename), None))
+    return sources, errors
+
+def _parse_recursive(sources, log_timings, encoding=None, include_handler=None):
     """Parse Beancount input, run its transformations and validate it.
 
     Recursively parse a list of files or strings and their include files and
@@ -297,6 +323,9 @@ def _parse_recursive(sources, log_timings, encoding=None):
       A tuple of (entries, parse_errors, options_map).
     """
     assert isinstance(sources, list) and all(isinstance(el, tuple) for el in sources)
+
+    if include_handler is None:
+        include_handler = _include_handler
 
     # Current parse state.
     entries, parse_errors = [], []
@@ -357,9 +386,8 @@ def _parse_recursive(sources, log_timings, encoding=None):
                      src_errors,
                      src_options_map) = parser.parse_string(source)
 
-                # If we're parsing a string, the CWD is the current process
-                # working directory.
-                cwd = os.getcwd()
+                # If we're parsing a string, the there is no cwd
+                cwd = None
 
             # Merge the entries resulting from the parsed file.
             entries.extend(src_entries)
@@ -373,26 +401,12 @@ def _parse_recursive(sources, log_timings, encoding=None):
             else:
                 aggregate_options_map(options_map, src_options_map)
 
-            # Add includes to the list of sources to process. chdir() for glob,
-            # which uses it indirectly.
+            # Add includes to the list of sources to process.
             include_expanded = []
-            with file_utils.chdir(cwd):
-                for include_filename in src_options_map['include']:
-                    matched_filenames = glob.glob(include_filename, recursive=True)
-                    if matched_filenames:
-                        include_expanded.extend(matched_filenames)
-                    else:
-                        parse_errors.append(
-                            LoadError(data.new_metadata("<load>", 0),
-                                      'File glob "{}" does not match any files'.format(
-                                          include_filename), None))
-            for include_filename in include_expanded:
-                if not path.isabs(include_filename):
-                    include_filename = path.join(cwd, include_filename)
-                include_filename = path.normpath(include_filename)
-
-                # Add the include filenames to be processed later.
-                source_stack.append((include_filename, True))
+            for include_filename in src_options_map['include']:
+                include_sources, include_errors = include_handler(cwd, include_filename)
+                source_stack.extend(include_sources)
+                parse_errors.extend(include_errors)
 
     # Make sure we have at least a dict of valid options.
     if options_map is None:
@@ -422,7 +436,7 @@ def aggregate_options_map(options_map, src_options_map):
         commodities.add(currency)
 
 
-def _load(sources, log_timings, extra_validations, encoding):
+def _load(sources, log_timings, extra_validations, encoding, include_handler=Node):
     """Parse Beancount input, run its transformations and validate it.
 
     (This is an internal method.)
@@ -451,7 +465,7 @@ def _load(sources, log_timings, extra_validations, encoding):
         log_timings = log_timings.write
 
     # Parse all the files recursively.
-    entries, parse_errors, options_map = _parse_recursive(sources, log_timings, encoding)
+    entries, parse_errors, options_map = _parse_recursive(sources, log_timings, encoding, include_handler)
 
     # Ensure that the entries are sorted before running any processes on them.
     entries.sort(key=data.entry_sortkey)
